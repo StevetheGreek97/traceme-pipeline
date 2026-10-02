@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Optional, TypeVar
 import argparse
@@ -11,8 +12,9 @@ import shutil
 
 import os
 
+from traceme.core.device import DEVICE_CHOICES
 from traceme.core.logging import add_file_handler, get_logger, set_log_context, timer
-from traceme.video.merge import merge_csv_chunks, merge_chunk_videos, merge_mask_chunks
+from traceme.video.merge import merge_contour_chunks, merge_csv_chunks, merge_chunk_videos, merge_mask_chunks
 from traceme.prompts.parser import YamlPromptParser
 from traceme.video.chunker import VideoChunker
 
@@ -34,6 +36,14 @@ class PipelineConfig:
     model: str | None = None
     resume: bool = True
     save_masks: bool = False
+    save_contours: bool = False
+    save_video: bool = True  # annotated .mp4 per chunk, merged into <clip>.mp4
+    # Inclusive range of frames to process (positions in the sorted frame
+    # list); None means the start/end of the video. Outputs keep the video's
+    # global frame indices.
+    start_frame: int | None = None
+    end_frame: int | None = None
+    device: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +56,9 @@ class PipelinePaths:
     merged_csv: Path
     merged_video: Path
     merged_masks: Path
+    merged_contours: Path
     run_summary: Path
+    resume_signature: Path
 
     @classmethod
     def from_config(cls, cfg: PipelineConfig) -> "PipelinePaths":
@@ -60,7 +72,9 @@ class PipelinePaths:
             merged_csv=cfg.output_folder / f"{cfg.frame_dir.name}.csv",
             merged_video=cfg.output_folder / f"{cfg.frame_dir.name}.mp4",
             merged_masks=cfg.output_folder / f"{cfg.frame_dir.name}_masks.npz",
+            merged_contours=cfg.output_folder / f"{cfg.frame_dir.name}_contours.jsonl",
             run_summary=cfg.output_folder / f"{cfg.frame_dir.name}_run_summary.json",
+            resume_signature=tmp_root / "resume_signature.json",
         )
 
 
@@ -116,6 +130,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist per-frame object masks as a compressed .npz per chunk "
              "(<chunk>_masks.npz, bit-packed) for downstream shape analysis."
     )
+    parser.add_argument(
+        "--save-contours", action="store_true",
+        help="Also write <clip>_contours.jsonl: per frame, each object's mask outline as "
+             "polygons (empty list = object lost). Small enough for visual review."
+    )
+    parser.add_argument(
+        "--no-video", action="store_true",
+        help="Don't render the annotated .mp4 (per chunk, merged into <clip>.mp4). "
+             "Saves time when only the CSV/masks/contours are needed."
+    )
+    parser.add_argument(
+        "--start-frame", type=int, default=None,
+        help="First frame to process, as a 0-based position in the sorted frame folder "
+             "(default: first frame). Outputs keep the video's frame numbers."
+    )
+    parser.add_argument(
+        "--end-frame", type=int, default=None,
+        help="Last frame to process, inclusive (default: last frame)."
+    )
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default=None,
+        help="Compute device (default: auto = CUDA, then Apple MPS, then CPU; "
+             "overrides TRACEME_DEVICE). An unavailable choice falls back to CPU."
+    )
     return parser
 
 
@@ -133,6 +173,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> PipelineConfig:
         model=args.model,
         resume=not args.no_resume,
         save_masks=args.save_masks,
+        save_contours=args.save_contours,
+        save_video=not args.no_video,
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
+        device=args.device,
     )
 
 
@@ -148,12 +193,18 @@ def _validate_inputs(cfg: PipelineConfig, log: logging.Logger) -> None:
     if not cfg.prompt_file.exists():
         log.error(f"prompt_file not found: {cfg.prompt_file}")
         raise SystemExit(2)
+    if cfg.start_frame is not None and cfg.start_frame < 0:
+        log.error(f"--start-frame must be >= 0, got {cfg.start_frame}")
+        raise SystemExit(2)
+    if cfg.start_frame is not None and cfg.end_frame is not None and cfg.end_frame < cfg.start_frame:
+        log.error(f"--end-frame ({cfg.end_frame}) is before --start-frame ({cfg.start_frame})")
+        raise SystemExit(2)
 
 
 def _log_config(cfg: PipelineConfig, log: logging.Logger) -> None:
     log.info(
         "Pipeline config: frame_dir=%s output=%s prompt=%s chunk_size=%s overlap=%s fps=%s "
-        "chunk_mode=%s model=%s del_tmp=%s",
+        "chunk_mode=%s model=%s device=%s frames=%s-%s del_tmp=%s",
         cfg.frame_dir,
         cfg.output_folder,
         cfg.prompt_file,
@@ -162,6 +213,9 @@ def _log_config(cfg: PipelineConfig, log: logging.Logger) -> None:
         cfg.fps,
         cfg.chunk_mode,
         cfg.model or os.environ.get("SAM2_MODEL", "<env>"),
+        cfg.device or os.environ.get("TRACEME_DEVICE", "auto"),
+        cfg.start_frame if cfg.start_frame is not None else "first",
+        cfg.end_frame if cfg.end_frame is not None else "last",
         cfg.del_tmp,
     )
 
@@ -190,8 +244,11 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     _validate_inputs(cfg, log)
     _log_config(cfg, log)
 
+    # Both are read when traceme.sam2.config is first imported, below.
     if cfg.model:
         os.environ["SAM2_MODEL"] = cfg.model
+    if cfg.device:
+        os.environ["TRACEME_DEVICE"] = cfg.device
 
     try:
         from traceme.sam2 import config as sam2_config
@@ -203,14 +260,28 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     sam2_config.log_model_summary(log)
     sam2_config.log_precision_summary(log)
 
-    chunker = VideoChunker(
-        frame_dir=cfg.frame_dir,
-        output_dir=paths.chunks_dir,
-        chunk_size=cfg.chunk_size,
-        overlap=cfg.overlap,
-        action="symlink",
-        remove_org=False,
+    try:
+        chunker = VideoChunker(
+            frame_dir=cfg.frame_dir,
+            output_dir=paths.chunks_dir,
+            chunk_size=cfg.chunk_size,
+            overlap=cfg.overlap,
+            action="symlink",
+            remove_org=False,
+            start_frame=cfg.start_frame or 0,
+            end_frame=cfg.end_frame,
+        )
+    except ValueError as e:
+        log.error(str(e))
+        raise SystemExit(2)
+    frame_offset = chunker.start_frame
+    log.info(
+        f"Processing frames {chunker.start_frame}-{chunker.end_frame} "
+        f"of {chunker.total_source_frames}"
     )
+
+    if cfg.resume:
+        _invalidate_stale_outputs(paths, _resume_signature(cfg, chunker), log, sam2_config.SEED_DIRNAME)
 
     _run_step(
         log,
@@ -227,6 +298,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         "Loading prompts",
         lambda: YamlPromptParser(cfg.prompt_file).load(strict_keys=False),
     ) or []
+    prompts = _prompts_in_range(prompts, chunker.start_frame, chunker.end_frame, log)
     by_chunk = YamlPromptParser.prompts_by_chunk(
         prompts,
         chunk_size=cfg.chunk_size,
@@ -251,6 +323,9 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             prepare_chunks=False,
             resume=cfg.resume,
             save_masks=cfg.save_masks,
+            save_contours=cfg.save_contours,
+            save_video=cfg.save_video,
+            frame_offset=frame_offset,
         ),
         fatal=True,
     ) or {}
@@ -262,12 +337,13 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         lambda: merge_csv_chunks(paths.files_dir, paths.merged_csv),
         fatal=False,
     )
-    _run_step(
-        log,
-        "Merging chunk videos",
-        lambda: merge_chunk_videos(paths.files_dir, paths.merged_video),
-        fatal=False,
-    )
+    if cfg.save_video:
+        _run_step(
+            log,
+            "Merging chunk videos",
+            lambda: merge_chunk_videos(paths.files_dir, paths.merged_video),
+            fatal=False,
+        )
     if cfg.save_masks:
         _run_step(
             log,
@@ -275,11 +351,18 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             lambda: merge_mask_chunks(paths.files_dir, paths.merged_masks),
             fatal=False,
         )
+    if cfg.save_contours:
+        _run_step(
+            log,
+            "Merging chunk contours",
+            lambda: merge_contour_chunks(paths.files_dir, paths.merged_contours),
+            fatal=False,
+        )
 
     _run_step(
         log,
         "Writing run summary",
-        lambda: _write_run_summary(paths.run_summary, cfg, summary),
+        lambda: _write_run_summary(paths.run_summary, cfg, summary, chunker),
         fatal=False,
     )
 
@@ -309,7 +392,58 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     log.info("Pipeline finished successfully.")
 
 
-def _write_run_summary(path: Path, cfg: PipelineConfig, summary: dict) -> None:
+def _prompts_in_range(prompts: list, start: int, end: int, log: logging.Logger) -> list:
+    """Keep prompts inside [start, end] and shift them to range-relative frame
+    indices, which is what the chunk math works in."""
+    kept = [replace(p, frame_idx=p.frame_idx - start) for p in prompts if start <= p.frame_idx <= end]
+    dropped = len(prompts) - len(kept)
+    if dropped:
+        log.warning(f"Ignoring {dropped} prompt(s) outside frames {start}-{end}")
+    if prompts and not kept:
+        log.error(f"No prompts fall inside frames {start}-{end}; nothing to track")
+        raise SystemExit(2)
+    return kept
+
+
+def _resume_signature(cfg: PipelineConfig, chunker: VideoChunker) -> dict:
+    """What a resumed chunk's outputs depend on. If any of it changes between
+    runs into the same output folder, completed chunks are stale."""
+    return {
+        "start_frame": chunker.start_frame,
+        "end_frame": chunker.end_frame,
+        "chunk_size": cfg.chunk_size,
+        "overlap": cfg.overlap,
+        "model": cfg.model or os.environ.get("SAM2_MODEL", "large"),
+        "prompts_sha256": hashlib.sha256(cfg.prompt_file.read_bytes()).hexdigest(),
+    }
+
+
+def _invalidate_stale_outputs(
+    paths: PipelinePaths, signature: dict, log: logging.Logger, seed_dirname: str
+) -> None:
+    """Drop completed-chunk outputs and seeds from a previous run whose inputs
+    differ (prompts, model, frame range, chunking), so resume can't silently
+    reuse results computed from other inputs."""
+    old = None
+    if paths.resume_signature.exists():
+        try:
+            old = json.loads(paths.resume_signature.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+    if old is not None and old != signature:
+        changed = sorted(k for k in signature if old.get(k) != signature[k])
+        log.warning(
+            "Inputs changed since the previous run in this folder (%s); "
+            "discarding its chunk outputs instead of resuming.",
+            ", ".join(changed) or "unknown",
+        )
+        shutil.rmtree(paths.files_dir, ignore_errors=True)
+        shutil.rmtree(paths.chunks_dir / seed_dirname, ignore_errors=True)
+    paths.resume_signature.parent.mkdir(parents=True, exist_ok=True)
+    paths.resume_signature.write_text(json.dumps(signature, indent=2), encoding="utf-8")
+
+
+def _write_run_summary(path: Path, cfg: PipelineConfig, summary: dict, chunker: VideoChunker | None = None) -> None:
     failed = summary.get("failed_chunks", [])
     payload = {
         "status": "partial" if failed else "complete",
@@ -326,6 +460,11 @@ def _write_run_summary(path: Path, cfg: PipelineConfig, summary: dict) -> None:
             "model": cfg.model or os.environ.get("SAM2_MODEL", "large"),
             "resume": cfg.resume,
             "save_masks": cfg.save_masks,
+            "save_contours": cfg.save_contours,
+            "save_video": cfg.save_video,
+            "start_frame": chunker.start_frame if chunker else cfg.start_frame,
+            "end_frame": chunker.end_frame if chunker else cfg.end_frame,
+            "device": cfg.device or os.environ.get("TRACEME_DEVICE", "auto"),
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)

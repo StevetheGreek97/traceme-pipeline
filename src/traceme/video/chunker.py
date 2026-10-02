@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Literal, Dict, Any
+from typing import Iterable, List, Literal, Dict, Any, Optional
 import shutil
 import re
 import json
@@ -41,6 +41,11 @@ class VideoChunker:
     overlap: int = 2
     action: str = "symlink"  # "copy", "move" or "symlink"
     remove_org: bool = False
+    # Inclusive range of source frames to chunk (by position in the sorted
+    # frame list). Defaults to the whole video; end_frame is resolved to the
+    # last frame's index once frames are listed.
+    start_frame: int = 0
+    end_frame: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.frame_dir = Path(self.frame_dir)
@@ -56,12 +61,29 @@ class VideoChunker:
 
         # Frames may not exist if user previously moved them.
         if self.frame_dir.exists():
-            self._frame_paths: List[Path] = sorted(
+            all_frames: List[Path] = sorted(
                 (p for p in self.frame_dir.iterdir() if p.suffix.lower() in _IMG_EXTS),
                 key=numeric_sort_key
             )
         else:
-            self._frame_paths = []
+            all_frames = []
+        self.total_source_frames = len(all_frames)
+        self._frame_paths = self._select_range(all_frames)
+
+    def _select_range(self, frames: List[Path]) -> List[Path]:
+        if self.start_frame < 0:
+            raise ValueError(f"start_frame must be >= 0, got {self.start_frame}")
+        if not frames:
+            return []
+        n = len(frames)
+        if self.end_frame is None:
+            self.end_frame = n - 1
+        if not (self.start_frame <= self.end_frame < n):
+            raise ValueError(
+                f"Frame range {self.start_frame}-{self.end_frame} is outside the video "
+                f"(frames 0-{n - 1} in {self.frame_dir})."
+            )
+        return frames[self.start_frame:self.end_frame + 1]
 
     # -------------------- Public API --------------------
 
@@ -197,6 +219,7 @@ class VideoChunker:
             "action": self.action,
             "num_chunks": len(chunk_dirs),
             "source_dir": str(self.frame_dir),
+            "frame_range": [self.start_frame, self.end_frame],
             "frame_names": [p.name for p in self._frame_paths],
         }
         self._write_manifest(manifest_payload)

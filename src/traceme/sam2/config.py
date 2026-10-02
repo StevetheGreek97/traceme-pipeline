@@ -7,6 +7,7 @@ import sam2
 
 from traceme.core.logging import get_logger
 from traceme.sam2.checkpoints import resolve_checkpoint, default_checkpoint_dir
+from traceme.core.device import DEVICE_CHOICES, pick_device
 log = get_logger("traceme.sam2.config")
 
 # Optional NVML import (unchanged)
@@ -101,15 +102,14 @@ def log_runtime_summary(logger=log) -> None:
 # ---------------------------
 # Device + precision setup (unchanged)
 # ---------------------------
-if torch.cuda.is_available():
-    device = torch.device("cuda")
+DEVICE_PREFERENCE = os.environ.get("TRACEME_DEVICE", "auto")
+device = pick_device(DEVICE_PREFERENCE)
+if device.type == "cuda":
     current_idx = torch.cuda.current_device()
     log.debug("Using CUDA device %s: %s", current_idx, torch.cuda.get_device_name(current_idx))
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
+elif device.type == "mps":
     log.debug("Using Apple Metal (MPS) device")
 else:
-    device = torch.device("cpu")
     log.debug("Using CPU device")
 
 AUTOCAST = nullcontext()
@@ -173,7 +173,12 @@ _cfg_abs  = (SAM2_PKG_DIR / _cfg_rel) if _cfg_rel else None  # must exist (SAM2 
 _ckpt_abs = SAM2_CHECKPOINTS[MODEL]                      # must exist
 _ckpt_err = None
 
-if not _ckpt_abs.exists():
+# An explicit SAM2_CHECKPOINT always wins (e.g. a checkpoint the TraceME app
+# already downloaded), even if a same-named file exists under SAM2_ROOT.
+_env_ckpt = os.getenv("SAM2_CHECKPOINT")
+if _env_ckpt:
+    _ckpt_abs = Path(_env_ckpt).expanduser()
+elif not _ckpt_abs.exists():
     ckpt_dir_env = os.getenv("SAM2_CHECKPOINT_DIR")
     try:
         _ckpt_abs = resolve_checkpoint(

@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 import csv
+import json
+
+import cv2
 import numpy as np
 
 from traceme.sam2.config import SEED_DIRNAME
+from traceme.sam2.masks import (
+    MaskRegion,
+    as_mask_region,
+    object_array,  # re-exported: callers have always imported it from here
+    squeeze_mask_2d,
+)
 
 
 def _seed_file(out_root: Path, cid: int) -> Path:
@@ -49,21 +58,30 @@ def _unpack_mask(packed: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 
 
 def global_to_inchunk_idx(global_idx: int, cid: int, chunk_size: int, overlap: int) -> int:
+    """In-chunk position of a frame. `global_idx` is relative to the first
+    processed frame (i.e. already shifted by any --start-frame offset)."""
+    return global_idx - _chunk_first_frame(cid, chunk_size, overlap)
+
+
+def _chunk_first_frame(cid: int, chunk_size: int, overlap: int) -> int:
+    """Index (relative to the processed range) of a chunk's first frame,
+    including its leading overlap frames."""
     start = cid * chunk_size
-    ovl_start = max(0, start - overlap) if cid > 0 and overlap > 0 else start
-    return global_idx - ovl_start
+    return max(0, start - overlap) if cid > 0 and overlap > 0 else start
 
 
 def _mask_stats(mask) -> tuple[int, float, float, int, int, int, int] | None:
     """
     Per-object mask stats: (area_px, centroid_x, centroid_y, bbox_x, bbox_y, bbox_w, bbox_h).
-    Returns None for an empty mask. Accepts (H,W), (1,H,W) or (H,W,1).
+    Returns None for an empty mask. Accepts a MaskRegion, or (H,W), (1,H,W)
+    or (H,W,1) arrays.
+
+    A MaskRegion answers from its crop, so the cost follows the object; a
+    plain array is still scanned in full.
     """
-    m = np.asarray(mask)
-    if m.ndim == 3 and m.shape[0] == 1:
-        m = m[0]
-    if m.ndim == 3 and m.shape[2] == 1:
-        m = m[..., 0]
+    if isinstance(mask, MaskRegion):
+        return mask.stats()
+    m = squeeze_mask_2d(mask)
     ys, xs = np.nonzero(m)
     if xs.size == 0:
         return None
@@ -84,6 +102,53 @@ def _mask_archive_path(csv_path: Path) -> Path:
     return csv_path.with_name(csv_path.stem + "_masks.npz")
 
 
+def _contours_path(csv_path: Path) -> Path:
+    return csv_path.with_name(csv_path.stem + "_contours.jsonl")
+
+
+def _mask_contours(mask, epsilon: float = 1.0) -> list[list[list[int]]]:
+    """Outer contours of every region of a mask, simplified with
+    approxPolyDP, as [[[x, y], ...], ...]. Empty list for an empty mask.
+
+    Accepts a MaskRegion or a plain array; a region traces only its bounding
+    box instead of the whole frame.
+    """
+    polys = []
+    for c in as_mask_region(mask).cv_contours():
+        if epsilon > 0:
+            c = cv2.approxPolyDP(c, epsilon, True)
+        pts = c.reshape(-1, 2)
+        if len(pts) >= 3:
+            polys.append(pts.astype(int).tolist())
+    return polys
+
+
+def _write_contours_for_chunk(
+    path: Path,
+    video_segments: dict[int, dict[int, np.ndarray]],
+    *,
+    cid: int,
+    cs: int,
+    ov: int,
+    frame_offset: int = 0,
+) -> None:
+    """One JSON line per frame: {"frame": g, "objects": {"<obj_id>": polygons}}.
+
+    A lightweight stand-in for the full masks, for visual review: an object
+    with an empty polygon list was tracked but lost on that frame; a frame
+    with no objects has an empty mapping.
+    """
+    first = _chunk_first_frame(cid, cs, ov) + frame_offset
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for in_idx in sorted(video_segments.keys()):
+            objs = {
+                str(int(oid)): _mask_contours(mask)
+                for oid, mask in sorted(video_segments[in_idx].items())
+            }
+            f.write(json.dumps({"frame": first + in_idx, "objects": objs}, separators=(",", ":")) + "\n")
+
+
 def _write_masks_for_chunk(
     path: Path,
     video_segments: dict[int, dict[int, np.ndarray]],
@@ -91,6 +156,7 @@ def _write_masks_for_chunk(
     cid: int,
     cs: int,
     ov: int,
+    frame_offset: int = 0,
 ) -> None:
     """Persist every non-empty object mask in a chunk as bit-packed arrays.
 
@@ -101,8 +167,7 @@ def _write_masks_for_chunk(
         ):
             mask = _unpack_mask(packed, tuple(shp))
     """
-    start = cid * cs
-    ovl_start = max(0, start - ov) if cid > 0 and ov > 0 else start
+    ovl_start = _chunk_first_frame(cid, cs, ov) + frame_offset
 
     global_idx_list: list[int] = []
     obj_id_list: list[int] = []
@@ -112,9 +177,10 @@ def _write_masks_for_chunk(
     for in_idx in sorted(video_segments.keys()):
         global_idx = ovl_start + in_idx
         for obj_id, mask in video_segments[in_idx].items():
-            if not np.any(mask):
+            region = as_mask_region(mask)
+            if region.is_empty:
                 continue
-            packed, shp = _pack_mask_bool(mask)
+            packed, shp = region.packed_full(), region.shape
             global_idx_list.append(global_idx)
             obj_id_list.append(int(obj_id))
             packed_list.append(packed)
@@ -125,9 +191,115 @@ def _write_masks_for_chunk(
         path,
         global_frame_idx=np.array(global_idx_list, dtype=np.int32),
         obj_id=np.array(obj_id_list, dtype=np.int32),
-        packed=np.array(packed_list, dtype=object),
+        packed=object_array(packed_list),
         shape=np.array(shape_list, dtype=object),
     )
+
+
+# ---------------------------------------------------------------- seed files
+#
+# A chunk saves the masks of its trailing overlap frames so the next chunk can
+# re-seed the same objects and keep their ids. Format 1 stored each mask
+# bit-packed over the whole frame in nested object arrays: at 5312x2988 with
+# 12 objects and 20 overlap frames that is ~475 MB to write and read back per
+# chunk. Format 2 stores each mask's bounding box and the packed crop inside
+# it, concatenated into one flat buffer -- the same masks in a few dozen KB,
+# with no pickled object arrays.
+#
+# Readers accept both, so a run can resume from seeds an older version wrote.
+
+SEED_FORMAT = 2
+
+
+def write_seed_file(
+    path: Path,
+    entries: list[tuple[int, int, MaskRegion]],
+    frame_shape: tuple[int, int],
+) -> int:
+    """Write overlap seeds as (in-chunk frame index, object id, mask) triples.
+
+    Returns the number of masks written. Empty masks are kept, not dropped:
+    re-seeding an object the tracker lost is what keeps its id alive into the
+    next chunk, so its "lost" rows keep appearing in the CSV.
+    """
+    kept = list(entries)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not kept:
+        blobs = np.zeros(0, dtype=np.uint8)
+        offsets = np.zeros(1, dtype=np.int64)
+    else:
+        crops = [reg.packed_crop().ravel() for _, _, reg in kept]
+        blobs = np.concatenate(crops)
+        offsets = np.zeros(len(crops) + 1, dtype=np.int64)
+        np.cumsum([c.size for c in crops], out=offsets[1:])
+
+    np.savez_compressed(
+        path,
+        format=np.array(SEED_FORMAT, dtype=np.int32),
+        frame_shape=np.array(frame_shape, dtype=np.int32),
+        rel_indices=np.array([r for r, _, _ in kept], dtype=np.int32),
+        obj_ids=np.array([o for _, o, _ in kept], dtype=np.int32),
+        boxes=np.array(
+            [[reg.y0, reg.x0, reg.height, reg.width] for _, _, reg in kept],
+            dtype=np.int32,
+        ).reshape(-1, 4),
+        areas=np.array([reg.area for _, _, reg in kept], dtype=np.int64),
+        packed=blobs,
+        packed_offsets=offsets,
+    )
+    return len(kept)
+
+
+def read_seed_file(path: Path) -> list[tuple[int, int, MaskRegion]]:
+    """Read overlap seeds written by either format, newest first in effort.
+
+    Returns (in-chunk frame index, object id, mask) triples.
+    """
+    with np.load(path, allow_pickle=True) as data:
+        keys = set(data.files)
+        if "boxes" in keys:  # format 2
+            rel = data["rel_indices"]
+            oids = data["obj_ids"]
+            boxes = data["boxes"]
+            areas = data["areas"]
+            blobs = data["packed"]
+            offsets = data["packed_offsets"]
+            shape = tuple(int(v) for v in data["frame_shape"])
+            out = []
+            for i in range(len(rel)):
+                y0, x0, h, w = (int(v) for v in boxes[i])
+                out.append((
+                    int(rel[i]),
+                    int(oids[i]),
+                    MaskRegion.from_packed_crop(
+                        blobs[offsets[i]:offsets[i + 1]], y0, x0, h, w,
+                        shape, area=int(areas[i]),
+                    ),
+                ))
+            return out
+
+        # format 1: per-frame nested object arrays of whole-frame packed masks
+        rel_indices = data["rel_indices"]
+        obj_ids_arr = data["obj_ids"]
+        packed_list = data["packed"]
+        shapes_list = data["shapes"]
+
+    out = []
+    for r, oids, packed_masks, shapes in zip(
+        rel_indices, obj_ids_arr, packed_list, shapes_list
+    ):
+        for oid, packed, shp in zip(
+            np.asarray(oids, dtype=np.int32), packed_masks, shapes
+        ):
+            out.append((
+                int(r),
+                int(oid),
+                MaskRegion.from_packed_full(
+                    np.asarray(packed, dtype=np.uint8), tuple(map(int, shp))
+                ),
+            ))
+    return out
 
 
 CSV_HEADER = [
@@ -144,13 +316,13 @@ def _write_csv_for_chunk(
     cid: int,
     cs: int,
     ov: int,
+    frame_offset: int = 0,
 ) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_HEADER)
-        start = cid * cs
-        ovl_start = max(0, start - ov) if cid > 0 and ov > 0 else start
+        ovl_start = _chunk_first_frame(cid, cs, ov) + frame_offset
         for in_idx in sorted(stats_per_frame.keys()):
             per_obj = stats_per_frame[in_idx]
             global_idx = ovl_start + in_idx

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import subprocess
 import shutil
 
@@ -6,6 +7,9 @@ import numpy as np
 import pandas as pd
 
 from traceme.core.logging import get_logger
+# From masks (numpy-only), never from sam2.io: io imports sam2.config, whose
+# module-level MODEL resolution would then run before the CLI sets SAM2_MODEL.
+from traceme.sam2.masks import object_array
 from traceme.video.chunker import numeric_sort_key
 
 try:
@@ -155,7 +159,7 @@ def merge_mask_chunks(input_dir: Path, output_npz: Path) -> None:
         output_npz,
         global_frame_idx=np.array([k[0] for k in keys_sorted], dtype=np.int32),
         obj_id=np.array([k[1] for k in keys_sorted], dtype=np.int32),
-        packed=np.array([merged[k][0] for k in keys_sorted], dtype=object),
+        packed=object_array([merged[k][0] for k in keys_sorted]),
         shape=np.array([merged[k][1] for k in keys_sorted], dtype=object),
     )
 
@@ -163,6 +167,45 @@ def merge_mask_chunks(input_dir: Path, output_npz: Path) -> None:
         f"[OK] Merged {len(mask_files)} chunk archives → {output_npz.name} "
         f"({len(keys_sorted)} mask entries)"
     )
+
+
+def merge_contour_chunks(input_dir: Path, output_jsonl: Path) -> None:
+    """
+    Merges chunk *_contours.jsonl files into one file named after frame_dir,
+    one line per frame. Boundary frames appear in adjacent chunks; per
+    (frame, object) the earlier chunk's entry is kept, matching the CSV merge.
+    """
+    contour_files = sorted(input_dir.glob("*_contours.jsonl"), key=numeric_sort_key)
+    if not contour_files:
+        log.warning(f"No chunk *_contours.jsonl files found in {input_dir}")
+        return
+
+    if _handle_single_file(contour_files, output_jsonl, "contours file"):
+        return
+
+    log.info(f"Merging {len(contour_files)} contour files...")
+    frames: dict[int, dict[str, list]] = {}
+    for path in contour_files:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    objs = frames.setdefault(int(rec["frame"]), {})
+                    for oid, polys in rec.get("objects", {}).items():
+                        objs.setdefault(oid, polys)
+        except Exception as e:
+            log.exception(f"Failed to read {path}: {e}")
+
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output_jsonl.with_name(output_jsonl.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for gidx in sorted(frames):
+            objs = dict(sorted(frames[gidx].items(), key=lambda kv: int(kv[0])))
+            f.write(json.dumps({"frame": gidx, "objects": objs}, separators=(",", ":")) + "\n")
+    tmp.replace(output_jsonl)
+    log.info(f"[OK] Merged {len(contour_files)} contour files → {output_jsonl.name} ({len(frames)} frames)")
 
 
 def merge_chunk_videos(input_dir: Path, output_file: Path) -> None:

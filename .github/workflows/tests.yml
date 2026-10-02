@@ -1,26 +1,36 @@
 name: Tests
 
+# Runs on every push and pull request, and is called by publish.yml so that a
+# release is only uploaded to PyPI when the tests pass.
 on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_call:
 
 jobs:
   tests:
+    name: Python ${{ matrix.python }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
 
-      - name: Install dependencies (CPU torch, no model packages)
+      # CPU torch keeps the download small; sam2 and the model weights are
+      # stubbed out by tests/conftest.py, so they aren't installed.
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy pandas opencv-python-headless pyyaml pytest imageio-ffmpeg
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pandas opencv-python-headless pyyaml imageio-ffmpeg pytest
 
       - name: Run tests
         run: pytest -q

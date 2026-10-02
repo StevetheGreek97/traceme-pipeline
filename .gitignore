@@ -27,3 +27,4 @@ __pycache__/
 sam2_configs/
 *.egg-info/
 examples/
+build/

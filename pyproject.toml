@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "traceme-pipeline"
-version = "0.5.0"
+version = "0.6.0"
 description = "TraceME video tracking pipeline using SAM2"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -66,6 +66,20 @@ Run the pipeline:
 traceme -i /path/to/frames -o /path/to/output -p /path/to/prompts.yaml
 ```
 
+Process only part of a video (frame numbers are 0-based positions in the sorted
+frame folder; both ends inclusive, and either can be omitted):
+```
+traceme -i /path/to/frames -o /path/to/output -p prompts.yaml --start-frame 1200 --end-frame 2400
+```
+Prompts outside the range are ignored, and outputs keep the video's frame numbers
+(`global_frame_idx` 1200 is frame 1200 of the video, not of the range).
+
+Choose the compute device (default `auto`: CUDA, then Apple MPS, then CPU; an
+unavailable choice falls back to CPU). Same as the `TRACEME_DEVICE` env var:
+```
+traceme ... --device cpu
+```
+
 Generate a tasks file for batch runs:
 ```
 traceme-gen-tasks /path/to/root -o tasks.tsv
@@ -88,7 +102,10 @@ Pass `--save-masks` to persist every object's binary mask, bit-packed, into
 `/output/clipA_masks.npz` — one merged archive per video (per-chunk masks are
 written alongside each chunk's CSV/video during the run, then combined the
 same way the merged CSV/video are, so `--del_tmp` does **not** remove them).
-Only non-empty masks are stored.
+Only non-empty masks are stored. The archive layout is unchanged from
+earlier versions -- one whole-frame bit-packed mask per (frame, object) --
+so existing readers keep working. It is also the most expensive part of a
+run: see [docs/performance.md](docs/performance.md).
 
 Reload the mask archive:
 ```python
@@ -106,9 +123,64 @@ for gidx, oid, packed, shp in zip(
     # props.eccentricity, props.perimeter, props.solidity, ...
 ```
 
+## Saving Contours (for visual review)
+Pass `--save-contours` to write `/output/clipA_contours.jsonl`: one JSON line per
+frame with each object's mask outline as polygons (all regions, simplified):
+```
+{"frame": 12, "objects": {"1": [[[x, y], ...]], "2": []}}
+```
+An empty list means the object was tracked but lost on that frame. The TraceME
+app uses this file to overlay tracking results without loading full masks.
+
+## Skipping the Video
+By default every chunk is rendered to an annotated `.mp4` and merged into
+`/output/clipA.mp4`. Pass `--no-video` to skip that when you only need the
+CSV, masks or contours; on long videos or small chunks it saves a noticeable
+amount of time. Turning the video back on for the same output folder
+re-processes chunks that have no video yet.
+
+## Chunk Size & Memory
+Masks are held as a bounding box plus a bit-packed crop
+(`traceme.sam2.masks.MaskRegion`), so tracking itself no longer scales with
+resolution or object count. Two things still do:
+
+```
+SAM2's frame cache   ~= chunk_size x 12.6 MB        (1024x1024x3 float32 per frame)
+--save-masks archive ~= chunk_size x objects x H x ceil(W/8)
+```
+
+The archive term dominates, because its file format stores each mask packed
+over the *whole* frame. For 12 objects at 5312x2988 that is 23.8 MB per frame
+of chunk, on top of 12.6 MB for the cache:
+
+| `-c` | frame cache | `--save-masks` | total |
+|---|---|---|---|
+| 300 | 3.8 GB | 7.1 GB | ~11 GB |
+| 1000 | 12.6 GB | 23.8 GB | ~36 GB |
+| 2000 | 25.2 GB | 47.6 GB | ~73 GB |
+| 3000 | 37.7 GB | 71.4 GB | ~109 GB |
+
+Without `--save-masks`, only the first column applies and chunk size is
+effectively unconstrained.
+
+Prefer large chunks within that budget: total tracking time is set by the frame
+count, but every chunk pays to build an inference state and re-seed its
+overlap, and every overlap frame is tracked twice. Keep `--overlap` small -- a
+handful of frames carries object identity across the seam, and re-seeding costs
+a forward pass per object per overlap frame.
+
+On SLURM, note that a job's memory limit is proportional to the cores it asks
+for unless `--mem` is set, so `--cpus-per-task=8` of a 96-core node grants
+1/12th of it.
+
+See [docs/performance.md](docs/performance.md) for measurements and how masks
+are stored.
+
 ## Resume & Failures
 - Completed chunks are marked in the tmp folder; re-running the same command skips them and continues from the first incomplete chunk. Use `--no-resume` to reprocess everything.
+- If the prompts, model, frame range or chunking changed since the previous run into the same output folder, its chunk outputs are discarded instead of resumed, so results never mix inputs.
 - If any chunk fails, the pipeline still merges what it has, marks the run `"partial"` in the run summary, keeps the tmp folder (even with `--del_tmp`), and exits with code 1. Re-run the same command to retry only the failed chunks.
+- Overlap seed files changed layout in v0.6.0 (bounding box plus packed crop, far smaller and faster). Seeds written by older versions are still read, so a run in progress resumes without reprocessing.
 
 ## Troubleshooting
 - If SAM2 configs or checkpoints are missing, TraceME will raise a clear error with the expected paths.

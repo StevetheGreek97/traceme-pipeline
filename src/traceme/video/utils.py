@@ -1,5 +1,6 @@
 """Compatibility exports for legacy utils usage."""
 
+from traceme.sam2.masks import MaskRegion, as_mask_region
 from traceme.sam2.io import (
     _seed_file,
     _pack_mask_bool,
@@ -17,6 +18,8 @@ from traceme.video.frames import (
 )
 
 __all__ = [
+    "MaskRegion",
+    "as_mask_region",
     "_seed_file",
     "_pack_mask_bool",
     "_unpack_mask",

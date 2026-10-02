@@ -9,16 +9,19 @@ from typing import Literal
 from sam2.build_sam import build_sam2_video_predictor
 from traceme.sam2.config import SAM2_CHECKPOINT, MODEL_CFG, IS_SAM3, device, SEED_DIRNAME
 from traceme.sam2.io import (
+    _contours_path,
     _done_marker,
     _mask_archive_path,
     _mask_stats,
     _seed_file,
-    _unpack_mask,
-    _pack_mask_bool,
+    _write_contours_for_chunk,
     _write_csv_for_chunk,
     _write_masks_for_chunk,
     global_to_inchunk_idx,
+    read_seed_file,
+    write_seed_file,
 )
+from traceme.sam2.masks import MaskRegion
 from traceme.core.logging import get_logger, timer
 from traceme.video.render import _render_chunk_video
 
@@ -43,6 +46,41 @@ def _release_state(inf_state):
     return None
 
 
+def _collect_regions(obj_ids, mask_logits) -> dict[int, MaskRegion]:
+    """Turn one frame of predicted logits into compact per-object masks.
+
+    Each object's bounding box comes from row and column projections reduced
+    on the tracker's own device, so only the pixels inside that box cross to
+    host memory instead of a frame-sized mask per object. One frame of 12
+    objects at 5312x2988 costs ~100 KB here rather than 190 MB, which is what
+    lets a chunk of any length be held at once.
+    """
+    m = mask_logits > 0
+    if m.ndim == 4 and m.shape[1] == 1:  # (N, 1, H, W) from both backends
+        m = m[:, 0]
+    if m.ndim != 3:
+        raise ValueError(f"expected (N,1,H,W) or (N,H,W) masks, got {tuple(m.shape)}")
+
+    _, h, w = m.shape
+    rows = m.any(dim=2).cpu().numpy()  # (N, H) -- which rows the object spans
+    cols = m.any(dim=1).cpu().numpy()  # (N, W) -- which columns
+    ids = obj_ids.tolist() if hasattr(obj_ids, "tolist") else list(obj_ids)
+
+    segs: dict[int, MaskRegion] = {}
+    for k, oid in enumerate(ids):
+        ys = np.flatnonzero(rows[k])
+        if ys.size == 0:  # tracked but lost on this frame
+            segs[int(oid)] = MaskRegion.empty((h, w))
+            continue
+        xs = np.flatnonzero(cols[k])
+        y0, y1 = int(ys[0]), int(ys[-1])
+        x0, x1 = int(xs[0]), int(xs[-1])
+        crop = m[k, y0 : y1 + 1, x0 : x1 + 1].cpu().numpy()
+        # The projections make this box tight by construction.
+        segs[int(oid)] = MaskRegion.from_tight_crop(crop, y0, x0, (h, w))
+    return segs
+
+
 def _finalize_chunk(
     *,
     cid: int,
@@ -50,14 +88,17 @@ def _finalize_chunk(
     csv_path: Path,
     mp4_path: Path,
     frame_files: list,
-    video_segments: dict,
+    video_segments: dict[int, dict[int, MaskRegion]],
     video_fps: int,
     skip_first: int,
     cs: int,
     ov: int,
     save_masks: bool = False,
+    save_contours: bool = False,
+    save_video: bool = True,
+    frame_offset: int = 0,
 ) -> tuple[int, int]:
-    """CPU-side per-chunk output: stats + CSV, annotated video, done marker.
+    """CPU-side per-chunk output: stats + CSV, annotated video (optional), done marker.
 
     Runs on the finalize thread so the GPU can start the next chunk. The done
     marker is written last, so a crash anywhere here leaves the chunk
@@ -74,23 +115,34 @@ def _finalize_chunk(
                 objects_in_chunk += len(spf)
                 stats_per_frame[idx] = spf
 
-        _write_csv_for_chunk(csv_path, stats_per_frame, cid=cid, cs=cs, ov=ov)
+        _write_csv_for_chunk(csv_path, stats_per_frame, cid=cid, cs=cs, ov=ov, frame_offset=frame_offset)
         log.info(
             f"[chunk {cid:03d}] wrote {csv_path.name} "
             f"(frames={len(stats_per_frame)}, objs={objects_in_chunk})"
         )
 
-    with timer(log, f"[chunk {cid:03d}] render_video"):
-        _render_chunk_video(
-            mp4_path, frame_files, video_segments, fps=video_fps, skip_first=skip_first
-        )
-        log.info(f"[chunk {cid:03d}] wrote {mp4_path.name}")
+    if save_video:
+        with timer(log, f"[chunk {cid:03d}] render_video"):
+            _render_chunk_video(
+                mp4_path, frame_files, video_segments, fps=video_fps, skip_first=skip_first
+            )
+            log.info(f"[chunk {cid:03d}] wrote {mp4_path.name}")
 
     if save_masks:
         with timer(log, f"[chunk {cid:03d}] write_masks"):
             masks_path = _mask_archive_path(csv_path)
-            _write_masks_for_chunk(masks_path, video_segments, cid=cid, cs=cs, ov=ov)
+            _write_masks_for_chunk(
+                masks_path, video_segments, cid=cid, cs=cs, ov=ov, frame_offset=frame_offset
+            )
             log.info(f"[chunk {cid:03d}] wrote {masks_path.name}")
+
+    if save_contours:
+        with timer(log, f"[chunk {cid:03d}] write_contours"):
+            contours_path = _contours_path(csv_path)
+            _write_contours_for_chunk(
+                contours_path, video_segments, cid=cid, cs=cs, ov=ov, frame_offset=frame_offset
+            )
+            log.info(f"[chunk {cid:03d}] wrote {contours_path.name}")
 
     _done_marker(out_root, cid).touch()
     log.info(f"[OK] chunk {cid:03d} complete")
@@ -107,9 +159,26 @@ def run_sam2(
     chunk_mode: Literal["auto", "load", "force"] = "auto",
     resume: bool = True,
     save_masks: bool = False,
+    save_contours: bool = False,
+    save_video: bool = True,
+    frame_offset: int = 0,
+    progress_every: int = 50,
+    finalize_workers: int = 2,
 ) -> dict:
     """
-    Process all chunks. Returns a summary dict:
+    Process all chunks. `frame_offset` is the global index of the first frame
+    the chunker holds (non-zero with --start-frame); outputs use global indices.
+    Logs "[chunk NNN] propagated k/n frames" every `progress_every` frames.
+
+    `finalize_workers` is how many finished chunks may be written out at once
+    while the GPU tracks ahead. Two lets a slow writer -- `--save-masks`
+    spends most of its time in zlib, which releases the GIL -- overlap with
+    tracking instead of stalling it. Masks are held compactly (see
+    traceme.sam2.masks), so each chunk in flight costs KB, and the real
+    per-chunk memory is SAM2's own frame cache (~12.6 MB per frame at
+    1024x1024 when offload_video_to_cpu is set).
+
+    Returns a summary dict:
     {"total_chunks", "processed_chunks", "resumed_chunks", "failed_chunks",
      "total_frames", "total_objects"} where the chunk entries are lists of ids.
     """
@@ -156,13 +225,21 @@ def run_sam2(
 
     # CSV/render/marker for a finished chunk run on this worker while the GPU
     # tracks the next chunk. At most one finalize is in flight, so memory
-    # holds at most two chunks' worth of masks.
-    finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="finalize")
+    # holds at most two chunks' worth of masks -- compact ones (see
+    # traceme.sam2.masks), so this costs KB per frame, not hundreds of MB.
+    finalize_workers = max(1, int(finalize_workers))
+    finalizer = ThreadPoolExecutor(
+        max_workers=finalize_workers, thread_name_prefix="finalize"
+    )
     pending: list[tuple[int, Future]] = []
 
-    def _collect_pending() -> None:
+    def _collect_pending(max_inflight: int = 0) -> None:
+        """Wait until at most `max_inflight` finalizes are still running.
+
+        Drained oldest-first, so `processed_chunks` stays in chunk order.
+        """
         nonlocal total_frames, total_objects
-        while pending:
+        while len(pending) > max_inflight:
             pcid, fut = pending.pop(0)
             try:
                 n_f, n_o = fut.result()
@@ -178,7 +255,12 @@ def run_sam2(
             csv_path = output / f"{base_name}_chunk_{cid:03d}.csv"
             mp4_path = output / f"{base_name}_chunk_{cid:03d}.mp4"
 
-            if resume and _done_marker(out_root, cid).exists() and csv_path.exists() and mp4_path.exists():
+            outputs = [csv_path] + ([mp4_path] if save_video else [])
+            if save_masks:
+                outputs.append(_mask_archive_path(csv_path))
+            if save_contours:
+                outputs.append(_contours_path(csv_path))
+            if resume and _done_marker(out_root, cid).exists() and all(p.exists() for p in outputs):
                 resumed_chunks.append(cid)
                 log.info(f"[chunk {cid:03d}] already complete; skipping (use --no-resume to reprocess)")
                 continue
@@ -212,30 +294,19 @@ def run_sam2(
                         # Seeds are kept on disk (not consumed) so an interrupted
                         # run can resume from the first incomplete chunk.
                         with timer(log, f"[chunk {cid:03d}] restore_seeds"):
-                            with np.load(prev_seed_path, allow_pickle=True) as data:
-                                rel_indices = data["rel_indices"].copy()
-                                obj_ids_arr = data["obj_ids"].copy()
-                                packed_list = data["packed"].copy()
-                                shapes_list = data["shapes"].copy()
-
                             restored = 0
-                            for r, oids, packed_masks, shapes in zip(
-                                rel_indices, obj_ids_arr, packed_list, shapes_list
-                            ):
-                                if r >= n_frames:
+                            for rel, oid, region in read_seed_file(prev_seed_path):
+                                if rel >= n_frames:
                                     continue
-                                oids = np.asarray(oids, dtype=np.int32)
-                                packed_masks = [np.asarray(pm, dtype=np.uint8) for pm in packed_masks]
-                                shapes = [tuple(map(int, shp)) for shp in shapes]
-                                for oid, packed, shp in zip(oids, packed_masks, shapes):
-                                    m = _unpack_mask(packed, shp)
-                                    predictor.add_new_mask(
-                                        inference_state=inf_state,
-                                        frame_idx=int(r),
-                                        obj_id=int(oid),
-                                        mask=m,
-                                    )
-                                    restored += 1
+                                # add_new_mask takes a frame-sized mask, so
+                                # this is the one place a region is expanded.
+                                predictor.add_new_mask(
+                                    inference_state=inf_state,
+                                    frame_idx=int(rel),
+                                    obj_id=int(oid),
+                                    mask=region.dense(),
+                                )
+                                restored += 1
                             log.info(f"[chunk {cid:03d}] restored {restored} seed masks from overlap")
                     else:
                         log.warning(
@@ -278,15 +349,16 @@ def run_sam2(
                         log.info(f"[chunk {cid:03d}] applied {applied} prompts")
 
                 # ---- propagate ----
-                video_segments: dict[int, dict[int, np.ndarray]] = {}
+                video_segments: dict[int, dict[int, MaskRegion]] = {}
                 with timer(log, f"[chunk {cid:03d}] propagate_and_collect"):
                     with torch.inference_mode(), autocast_ctx:
                         for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inf_state):
-                            masks_gpu = out_mask_logits > 0
-                            masks_cpu = masks_gpu.to("cpu", dtype=torch.uint8, non_blocking=True)
-                            ids_cpu = torch.as_tensor(out_obj_ids, dtype=torch.int32).cpu()
-                            segs = {int(ids_cpu[i]): masks_cpu[i].numpy() for i in range(masks_cpu.shape[0])}
-                            video_segments[out_frame_idx] = segs
+                            video_segments[out_frame_idx] = _collect_regions(
+                                out_obj_ids, out_mask_logits
+                            )
+                            done = len(video_segments)
+                            if progress_every > 0 and (done % progress_every == 0 or done == n_frames):
+                                log.info(f"[chunk {cid:03d}] propagated {done}/{n_frames} frames")
 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -295,36 +367,26 @@ def run_sam2(
                 if ov > 0:
                     with timer(log, f"[chunk {cid:03d}] write_overlap_seeds"):
                         tail_start = max(0, n_frames - ov)
-                        tail_indices = list(range(tail_start, n_frames))
-                        rel_indices, obj_ids_per_rel, packed_per_rel, shapes_per_rel = [], [], [], []
-                        for rel, abs_idx in enumerate(tail_indices):
+                        entries: list[tuple[int, int, MaskRegion]] = []
+                        seeded_frames = 0
+                        for rel, abs_idx in enumerate(range(tail_start, n_frames)):
                             segs = video_segments.get(abs_idx, {})
                             if not segs:
                                 continue
-                            rel_indices.append(rel)
-                            oids_row, packed_row, shapes_row = [], [], []
-                            for oid, mask_bool in segs.items():
-                                packed, shp = _pack_mask_bool(mask_bool)
-                                oids_row.append(int(oid))
-                                packed_row.append(packed)
-                                shapes_row.append(shp)
-                            obj_ids_per_rel.append(np.array(oids_row, dtype=np.int32))
-                            packed_per_rel.append(np.array(packed_row, dtype=object))
-                            shapes_per_rel.append(np.array(shapes_row, dtype=object))
+                            seeded_frames += 1
+                            entries.extend((rel, int(oid), reg) for oid, reg in segs.items())
 
-                        if rel_indices:
+                        if entries:
                             sf = _seed_file(out_root, cid)
-                            np.savez_compressed(
-                                sf,
-                                rel_indices=np.array(rel_indices, dtype=np.int32),
-                                obj_ids=np.array(obj_ids_per_rel, dtype=object),
-                                packed=np.array(packed_per_rel, dtype=object),
-                                shapes=np.array(shapes_per_rel, dtype=object),
+                            n_seeds = write_seed_file(sf, entries, entries[0][2].shape)
+                            log.info(
+                                f"[chunk {cid:03d}] wrote seeds → {sf.name} "
+                                f"(frames={seeded_frames}, masks={n_seeds})"
                             )
-                            log.info(f"[chunk {cid:03d}] wrote seeds → {sf.name} (frames={len(rel_indices)})")
 
                 # ---- hand off CSV/video/marker to the finalize worker ----
-                _collect_pending()  # bound in-flight finalizes (and memory) to one
+                # Keep a slot free for the chunk about to be submitted.
+                _collect_pending(max_inflight=finalize_workers - 1)
                 skip = min(ov, cid * cs) if (cid > 0 and ov > 0) else 0
                 pending.append((
                     cid,
@@ -341,6 +403,9 @@ def run_sam2(
                         cs=cs,
                         ov=ov,
                         save_masks=save_masks,
+                        save_contours=save_contours,
+                        save_video=save_video,
+                        frame_offset=frame_offset,
                     ),
                 ))
 
